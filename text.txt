@@ -1,0 +1,76 @@
+{
+  "properties": {
+    "displayName": "AIB staging resource groups - allowed resource types only",
+    "policyType": "Custom",
+    "mode": "All",
+    "description": "Restricts resource creation in Azure Image Builder staging resource groups to resource types required for image build and image development activities.",
+    "metadata": {
+      "category": "Image Factory",
+      "version": "1.0.0"
+    },
+    "parameters": {
+      "allowedResourceTypes": {
+        "type": "Array",
+        "metadata": {
+          "displayName": "Allowed resource types",
+          "description": "Resource types allowed in AIB staging resource groups."
+        },
+        "defaultValue": [
+          "Microsoft.Resources/deployments",
+
+          "Microsoft.VirtualMachineImages/imageTemplates",
+          "Microsoft.VirtualMachineImages/imageTemplates/triggers",
+
+          "Microsoft.Compute/virtualMachines",
+          "Microsoft.Compute/virtualMachines/extensions",
+          "Microsoft.Compute/disks",
+          "Microsoft.Compute/snapshots",
+          "Microsoft.Compute/images",
+
+          "Microsoft.Compute/galleries",
+          "Microsoft.Compute/galleries/images",
+          "Microsoft.Compute/galleries/images/versions",
+
+          "Microsoft.Network/networkInterfaces",
+          "Microsoft.Network/publicIPAddresses",
+          "Microsoft.Network/loadBalancers",
+          "Microsoft.Network/networkSecurityGroups",
+          "Microsoft.Network/networkSecurityGroups/securityRules",
+          "Microsoft.Network/privateLinkServices",
+          "Microsoft.Network/virtualNetworks",
+          "Microsoft.Network/virtualNetworks/subnets",
+
+          "Microsoft.Storage/storageAccounts",
+          "Microsoft.Storage/storageAccounts/blobServices",
+          "Microsoft.Storage/storageAccounts/blobServices/containers",
+
+          "Microsoft.ContainerInstance/containerGroups",
+
+          "Microsoft.ManagedIdentity/userAssignedIdentities"
+        ]
+      },
+      "effect": {
+        "type": "String",
+        "metadata": {
+          "displayName": "Effect",
+          "description": "Use Audit first, then switch to Deny after validation."
+        },
+        "allowedValues": [
+          "Audit",
+          "Deny",
+          "Disabled"
+        ],
+        "defaultValue": "Audit"
+      }
+    },
+    "policyRule": {
+      "if": {
+        "field": "type",
+        "notIn": "[parameters('allowedResourceTypes')]"
+      },
+      "then": {
+        "effect": "[parameters('effect')]"
+      }
+    }
+  }
+}
