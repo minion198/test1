@@ -1,22 +1,16 @@
-name: Import Container Image from Storage to ACR
+name: Import Container TAR from Storage to ACR
 
 on:
   workflow_dispatch:
     inputs:
       blob_name:
-        description: "Blob path and TAR filename in the Storage container"
+        description: "Blob path and TAR filename"
         required: true
         type: string
         default: "myapp/myapp-1.0.0.tar"
 
-      source_image:
-        description: "Image name and tag stored inside the TAR"
-        required: true
-        type: string
-        default: "myapp:1.0.0"
-
       acr_repository:
-        description: "Destination ACR repository name without the tag"
+        description: "Destination ACR repository"
         required: true
         type: string
         default: "apps/myapp"
@@ -28,7 +22,6 @@ on:
         default: "1.0.0"
 
 permissions:
-  id-token: write
   contents: read
 
 env:
@@ -37,15 +30,13 @@ env:
   STORAGE_CONTAINER_NAME: ${{ vars.STORAGE_CONTAINER_NAME }}
   ACR_NAME: ${{ vars.ACR_NAME }}
 
-  # Docker was installed offline in this location
+  # Offline-installed executables
   DOCKER_EXE: 'C:\Program Files\Docker\docker.exe'
-
-  # Prevent unnecessary Azure CLI output from being written to logs
-  AZURE_CORE_OUTPUT: none
+  AZ_EXE: 'C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd'
 
 jobs:
   import-image:
-    name: Import image to ACR
+    name: Import TAR to ACR
 
     runs-on:
       - self-hosted
@@ -55,9 +46,6 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      # No checkout step is required because this workflow does not use
-      # files from the GitHub repository.
-
       - name: Validate runner prerequisites
         shell: powershell
         run: |
@@ -68,26 +56,28 @@ jobs:
               STORAGE_CONTAINER_NAME = $env:STORAGE_CONTAINER_NAME
               ACR_NAME               = $env:ACR_NAME
               DOCKER_EXE             = $env:DOCKER_EXE
+              AZ_EXE                 = $env:AZ_EXE
           }
 
-          foreach ($entry in $requiredVariables.GetEnumerator()) {
-              if ([string]::IsNullOrWhiteSpace([string]$entry.Value)) {
-                  throw "Required variable '$($entry.Key)' is not configured."
+          foreach ($item in $requiredVariables.GetEnumerator()) {
+              if ([string]::IsNullOrWhiteSpace([string]$item.Value)) {
+                  throw "Required variable '$($item.Key)' is not configured."
               }
           }
 
           if (-not (Test-Path -LiteralPath $env:DOCKER_EXE)) {
-              throw "Docker executable was not found at: $env:DOCKER_EXE"
+              throw "Docker executable not found: $env:DOCKER_EXE"
           }
 
-          if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
-              throw "Azure CLI is not installed or is not available in PATH."
+          if (-not (Test-Path -LiteralPath $env:AZ_EXE)) {
+              throw "Azure CLI executable not found: $env:AZ_EXE"
           }
 
-          Write-Host "Docker executable: $env:DOCKER_EXE"
           Write-Host "Storage account: $env:STORAGE_ACCOUNT_NAME"
           Write-Host "Storage container: $env:STORAGE_CONTAINER_NAME"
           Write-Host "Destination ACR: $env:ACR_NAME"
+          Write-Host "Docker executable: $env:DOCKER_EXE"
+          Write-Host "Azure CLI executable: $env:AZ_EXE"
 
       - name: Start and validate Docker service
         shell: powershell
@@ -115,20 +105,7 @@ jobs:
               throw "Docker Engine is not responding."
           }
 
-          & "$env:DOCKER_EXE" info
-
-          if ($LASTEXITCODE -ne 0) {
-              throw "Unable to retrieve Docker Engine information."
-          }
-
-      - name: Azure login using OIDC
-        uses: azure/login@v3
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
-      - name: Prepare local working directory
+      - name: Prepare working directories
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
@@ -141,8 +118,17 @@ jobs:
               $workDirectory `
               "container-image.tar"
 
+          $azureConfigDirectory = Join-Path `
+              $workDirectory `
+              "azure-cli"
+
           New-Item `
               -Path $workDirectory `
+              -ItemType Directory `
+              -Force | Out-Null
+
+          New-Item `
+              -Path $azureConfigDirectory `
               -ItemType Directory `
               -Force | Out-Null
 
@@ -158,14 +144,75 @@ jobs:
                   -Encoding utf8 `
                   -Append
 
-          Write-Host "Working directory created: $workDirectory"
+          # Keeps Azure CLI tokens isolated to this workflow run.
+          "AZURE_CONFIG_DIR=$azureConfigDirectory" |
+              Out-File `
+                  -FilePath $env:GITHUB_ENV `
+                  -Encoding utf8 `
+                  -Append
+
+          Write-Host "Working directory: $workDirectory"
+          Write-Host "Local TAR path: $imageTarPath"
+
+      - name: Azure login using service principal
+        shell: powershell
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $requiredSecrets = @{
+              AZURE_CLIENT_ID       = $env:AZURE_CLIENT_ID
+              AZURE_CLIENT_SECRET   = $env:AZURE_CLIENT_SECRET
+              AZURE_TENANT_ID       = $env:AZURE_TENANT_ID
+              AZURE_SUBSCRIPTION_ID = $env:AZURE_SUBSCRIPTION_ID
+          }
+
+          foreach ($item in $requiredSecrets.GetEnumerator()) {
+              if ([string]::IsNullOrWhiteSpace([string]$item.Value)) {
+                  throw "GitHub secret '$($item.Key)' is not configured."
+              }
+          }
+
+          & "$env:AZ_EXE" login `
+              --service-principal `
+              --username "$env:AZURE_CLIENT_ID" `
+              "--password=$env:AZURE_CLIENT_SECRET" `
+              --tenant "$env:AZURE_TENANT_ID" `
+              --output none `
+              --only-show-errors
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Azure service principal login failed."
+          }
+
+          & "$env:AZ_EXE" account set `
+              --subscription "$env:AZURE_SUBSCRIPTION_ID"
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Failed to select Azure subscription."
+          }
+
+          $account = & "$env:AZ_EXE" account show `
+              --query "{subscription:name, subscriptionId:id, tenantId:tenantId}" `
+              --output json `
+              --only-show-errors
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Unable to validate the Azure login."
+          }
+
+          $account | Write-Host
 
       - name: Validate blob exists
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
 
-          $blobExists = az storage blob exists `
+          $blobExists = & "$env:AZ_EXE" storage blob exists `
               --account-name "$env:STORAGE_ACCOUNT_NAME" `
               --container-name "$env:STORAGE_CONTAINER_NAME" `
               --name "${{ inputs.blob_name }}" `
@@ -188,27 +235,28 @@ jobs:
           "@
           }
 
-          Write-Host "Blob exists: ${{ inputs.blob_name }}"
+          Write-Host "Blob found: ${{ inputs.blob_name }}"
 
       - name: Download image TAR from Storage
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
 
-          az storage blob download `
+          & "$env:AZ_EXE" storage blob download `
               --account-name "$env:STORAGE_ACCOUNT_NAME" `
               --container-name "$env:STORAGE_CONTAINER_NAME" `
               --name "${{ inputs.blob_name }}" `
               --file "$env:IMAGE_TAR_PATH" `
               --auth-mode login `
+              --overwrite true `
               --only-show-errors
 
           if ($LASTEXITCODE -ne 0) {
-              throw "Failed to download the image TAR from Azure Storage."
+              throw "Failed to download the TAR from Azure Storage."
           }
 
           if (-not (Test-Path -LiteralPath $env:IMAGE_TAR_PATH)) {
-              throw "Downloaded TAR file was not found at $env:IMAGE_TAR_PATH."
+              throw "Downloaded TAR was not found: $env:IMAGE_TAR_PATH"
           }
 
           $file = Get-Item -LiteralPath $env:IMAGE_TAR_PATH
@@ -221,51 +269,143 @@ jobs:
               -LiteralPath $env:IMAGE_TAR_PATH `
               -Algorithm SHA256
 
-          Write-Host "Downloaded file: $($file.FullName)"
-          Write-Host "File size: $($file.Length) bytes"
-          Write-Host "SHA256: $($hash.Hash)"
+          Write-Host "Downloaded size: $($file.Length) bytes"
+          Write-Host "TAR SHA256: $($hash.Hash)"
 
-      - name: Load Docker image from TAR
+      - name: Load TAR and detect image ID
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
 
-          & "$env:DOCKER_EXE" load `
-              --input "$env:IMAGE_TAR_PATH"
+          $beforeImageIds = @(
+              & "$env:DOCKER_EXE" image ls `
+                  --all `
+                  --no-trunc `
+                  --quiet |
+                  Sort-Object -Unique
+          )
 
-          if ($LASTEXITCODE -ne 0) {
-              throw "Docker failed to load the image TAR."
+          Write-Host "Loading Docker image TAR..."
+
+          $loadOutput = @(
+              & "$env:DOCKER_EXE" load `
+                  --input "$env:IMAGE_TAR_PATH" 2>&1
+          )
+
+          $loadExitCode = $LASTEXITCODE
+
+          foreach ($line in $loadOutput) {
+              Write-Host ([string]$line)
           }
 
-      - name: Validate loaded image
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          & "$env:DOCKER_EXE" image inspect `
-              "${{ inputs.source_image }}"
-
-          if ($LASTEXITCODE -ne 0) {
-              Write-Host "Images currently available on the runner:"
-
-              & "$env:DOCKER_EXE" image ls
-
+          if ($loadExitCode -ne 0) {
               throw @"
-          The expected image was not found after docker load.
+          Docker failed to load the TAR.
 
-          Expected image: ${{ inputs.source_image }}
-
-          Verify that source_image exactly matches the repository and tag
-          stored inside the TAR file.
+          Confirm that it is a Docker image archive created using
+          'docker save', not a container filesystem created using
+          'docker export'.
           "@
           }
 
-      - name: Login to ACR
+          $detectedImageIds = @()
+
+          foreach ($line in $loadOutput) {
+              $text = [string]$line
+
+              # Example: Loaded image ID: sha256:abc123
+              if ($text -match "Loaded image ID:\s*(sha256:[a-fA-F0-9]+)") {
+                  $detectedImageIds += $Matches[1]
+                  continue
+              }
+
+              # Also supports a TAR that unexpectedly contains a tag.
+              if ($text -match "Loaded image:\s*(.+)$") {
+                  $loadedReference = $Matches[1].Trim()
+
+                  $inspectedId = & "$env:DOCKER_EXE" image inspect `
+                      --format "{{.Id}}" `
+                      "$loadedReference"
+
+                  if ($LASTEXITCODE -eq 0 -and $inspectedId) {
+                      $detectedImageIds += $inspectedId.Trim()
+                  }
+              }
+          }
+
+          $detectedImageIds = @(
+              $detectedImageIds |
+                  Where-Object { $_ } |
+                  Sort-Object -Unique
+          )
+
+          # Fallback: compare Docker images before and after loading.
+          if ($detectedImageIds.Count -eq 0) {
+              $afterImageIds = @(
+                  & "$env:DOCKER_EXE" image ls `
+                      --all `
+                      --no-trunc `
+                      --quiet |
+                      Sort-Object -Unique
+              )
+
+              $detectedImageIds = @(
+                  $afterImageIds |
+                      Where-Object { $_ -notin $beforeImageIds }
+              )
+          }
+
+          if ($detectedImageIds.Count -eq 0) {
+              throw "Docker loaded the TAR, but the image ID could not be detected."
+          }
+
+          if ($detectedImageIds.Count -gt 1) {
+              Write-Host "Detected image IDs:"
+
+              foreach ($imageId in $detectedImageIds) {
+                  Write-Host " - $imageId"
+              }
+
+              throw "The TAR contains more than one image. One image per TAR is required."
+          }
+
+          $sourceImageId = $detectedImageIds[0]
+
+          $sourceImagePreexisted = if (
+              $sourceImageId -in $beforeImageIds
+          ) {
+              "true"
+          }
+          else {
+              "false"
+          }
+
+          & "$env:DOCKER_EXE" image inspect "$sourceImageId"
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Detected image ID could not be inspected: $sourceImageId"
+          }
+
+          "SOURCE_IMAGE_ID=$sourceImageId" |
+              Out-File `
+                  -FilePath $env:GITHUB_ENV `
+                  -Encoding utf8 `
+                  -Append
+
+          "SOURCE_IMAGE_PREEXISTED=$sourceImagePreexisted" |
+              Out-File `
+                  -FilePath $env:GITHUB_ENV `
+                  -Encoding utf8 `
+                  -Append
+
+          Write-Host "Detected source image ID: $sourceImageId"
+
+      - name: Obtain ACR access token and Docker login
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
 
-          $acrLoginJson = az acr login `
+          $acrLoginJson = & "$env:AZ_EXE" acr login `
               --name "$env:ACR_NAME" `
               --expose-token `
               --output json `
@@ -282,7 +422,7 @@ jobs:
           }
 
           if ([string]::IsNullOrWhiteSpace($acrLogin.loginServer)) {
-              throw "ACR login did not return the registry login server."
+              throw "ACR login did not return a login server."
           }
 
           $acrLogin.accessToken |
@@ -316,24 +456,27 @@ jobs:
 
           Write-Host "Destination image: $targetImage"
 
-      - name: Tag image for ACR
+      - name: Tag image ID for ACR
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
 
-          & "$env:DOCKER_EXE" tag `
-              "${{ inputs.source_image }}" `
-              "$env:TARGET_IMAGE"
-
-          if ($LASTEXITCODE -ne 0) {
-              throw "Failed to tag the Docker image."
+          if ([string]::IsNullOrWhiteSpace($env:SOURCE_IMAGE_ID)) {
+              throw "SOURCE_IMAGE_ID was not detected."
           }
 
-          & "$env:DOCKER_EXE" image inspect `
+          & "$env:DOCKER_EXE" tag `
+              "$env:SOURCE_IMAGE_ID" `
               "$env:TARGET_IMAGE"
 
           if ($LASTEXITCODE -ne 0) {
-              throw "The destination image tag was not created."
+              throw "Failed to tag the image for ACR."
+          }
+
+          & "$env:DOCKER_EXE" image inspect "$env:TARGET_IMAGE"
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Destination ACR tag was not created."
           }
 
       - name: Push image to ACR
@@ -343,8 +486,7 @@ jobs:
 
           Write-Host "Pushing image: $env:TARGET_IMAGE"
 
-          & "$env:DOCKER_EXE" push `
-              "$env:TARGET_IMAGE"
+          & "$env:DOCKER_EXE" push "$env:TARGET_IMAGE"
 
           if ($LASTEXITCODE -ne 0) {
               throw "Docker push to ACR failed."
@@ -361,17 +503,17 @@ jobs:
               "${{ inputs.image_tag }}"
           ) -join ""
 
-          az acr repository show `
+          & "$env:AZ_EXE" acr repository show `
               --name "$env:ACR_NAME" `
               --image "$acrImage" `
               --output table `
               --only-show-errors
 
           if ($LASTEXITCODE -ne 0) {
-              throw "Image push completed, but verification in ACR failed."
+              throw "Image push completed, but ACR verification failed."
           }
 
-          Write-Host "Image successfully imported:"
+          Write-Host "Image successfully pushed:"
           Write-Host "$env:TARGET_IMAGE"
 
       - name: Cleanup runner
@@ -396,12 +538,18 @@ jobs:
           }
 
           if (
-              "${{ inputs.source_image }}" -and
+              $env:SOURCE_IMAGE_ID -and
+              $env:SOURCE_IMAGE_PREEXISTED -eq "false" -and
               (Test-Path -LiteralPath $env:DOCKER_EXE)
           ) {
               & "$env:DOCKER_EXE" image rm `
                   --force `
-                  "${{ inputs.source_image }}" 2>$null
+                  "$env:SOURCE_IMAGE_ID" 2>$null
+          }
+
+          if (Test-Path -LiteralPath $env:AZ_EXE) {
+              & "$env:AZ_EXE" logout 2>$null
+              & "$env:AZ_EXE" account clear 2>$null
           }
 
           if (
