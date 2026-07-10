@@ -1,0 +1,415 @@
+name: Terraform Dev Deployment
+
+run-name: >-
+  Terraform ${{ inputs.terraform_action }}
+  - ${{ inputs.infrastructure_component }}
+  - Dev
+
+on:
+  workflow_dispatch:
+    inputs:
+      infrastructure_component:
+        description: "Infrastructure composition to deploy"
+        required: true
+        type: choice
+        options:
+          - container-app-environment
+          - container-apps
+          - postgres
+          - storage-account
+          - key-vault
+          - redis
+          - log-analytics
+
+      terraform_action:
+        description: "Terraform operation"
+        required: true
+        default: plan
+        type: choice
+        options:
+          - plan
+          - apply
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terraform-dev-${{ inputs.infrastructure_component }}
+  cancel-in-progress: false
+
+env:
+  TF_VERSION: "1.11.4"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+  DEPLOYMENT_ENVIRONMENT: "dev"
+  TF_WORKING_DIRECTORY: infrastructure/${{ inputs.infrastructure_component }}
+  TFVARS_FILE: dev.tfvars
+  TF_STATE_KEY: dev/${{ inputs.infrastructure_component }}.tfstate
+
+jobs:
+
+  # ===========================================================================
+  # Validate the selected component and required Terraform files
+  # ===========================================================================
+  validate-inputs:
+    name: Validate Pipeline Inputs
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate infrastructure directory
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Component:         ${{ inputs.infrastructure_component }}"
+          echo "Environment:       ${DEPLOYMENT_ENVIRONMENT}"
+          echo "Working directory: ${TF_WORKING_DIRECTORY}"
+          echo "Variables file:    ${TFVARS_FILE}"
+          echo "Terraform state:   ${TF_STATE_KEY}"
+
+          if [[ ! -d "${TF_WORKING_DIRECTORY}" ]]; then
+            echo "::error::Infrastructure directory not found: ${TF_WORKING_DIRECTORY}"
+            exit 1
+          fi
+
+          if [[ ! -f "${TF_WORKING_DIRECTORY}/main.tf" ]]; then
+            echo "::error::main.tf not found in ${TF_WORKING_DIRECTORY}"
+            exit 1
+          fi
+
+          if [[ ! -f "${TF_WORKING_DIRECTORY}/${TFVARS_FILE}" ]]; then
+            echo "::error::Variables file not found: ${TF_WORKING_DIRECTORY}/${TFVARS_FILE}"
+            exit 1
+          fi
+
+          if [[ ! -f "${TF_WORKING_DIRECTORY}/backend.tf" ]]; then
+            echo "::error::backend.tf not found in ${TF_WORKING_DIRECTORY}"
+            exit 1
+          fi
+
+  # ===========================================================================
+  # Terraform formatting and static validation
+  # ===========================================================================
+  terraform-quality:
+    name: Terraform Quality Checks
+    needs: validate-inputs
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform format check
+        shell: bash
+        run: |
+          terraform fmt \
+            -check \
+            -recursive \
+            -diff
+
+      - name: Terraform init without backend
+        working-directory: ${{ env.TF_WORKING_DIRECTORY }}
+        shell: bash
+        run: |
+          terraform init \
+            -backend=false \
+            -input=false
+
+      - name: Terraform validate
+        working-directory: ${{ env.TF_WORKING_DIRECTORY }}
+        shell: bash
+        run: |
+          terraform validate \
+            -no-color
+
+  # ===========================================================================
+  # Generate Terraform plan
+  #
+  # This job does not reference the protected Dev environment.
+  # Therefore, the Required Reviewers gate is not triggered during planning.
+  # ===========================================================================
+  terraform-plan:
+    name: Terraform Plan
+    needs:
+      - validate-inputs
+      - terraform-quality
+
+    runs-on: ubuntu-latest
+
+    env:
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Login to Azure using Service Principal
+        uses: azure/login@v2
+        with:
+          creds: >-
+            {
+              "clientId": "${{ vars.AZURE_CLIENT_ID }}",
+              "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
+              "subscriptionId": "${{ vars.AZURE_SUBSCRIPTION_ID }}",
+              "tenantId": "${{ vars.AZURE_TENANT_ID }}"
+            }
+
+      - name: Verify Azure context
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ACTUAL_SUBSCRIPTION_ID="$(
+            az account show \
+              --query id \
+              --output tsv
+          )"
+
+          if [[ "${ACTUAL_SUBSCRIPTION_ID}" != "${ARM_SUBSCRIPTION_ID}" ]]; then
+            echo "::error::Authenticated to an unexpected Azure subscription."
+            echo "::error::Expected subscription: ${ARM_SUBSCRIPTION_ID}"
+            echo "::error::Actual subscription: ${ACTUAL_SUBSCRIPTION_ID}"
+            exit 1
+          fi
+
+          az account show \
+            --query "{
+              subscriptionName:name,
+              subscriptionId:id,
+              tenantId:tenantId
+            }" \
+            --output table
+
+      - name: Terraform init
+        working-directory: ${{ env.TF_WORKING_DIRECTORY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          terraform init \
+            -reconfigure \
+            -input=false \
+            -backend-config="resource_group_name=${{ vars.TF_STATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TF_STATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TF_STATE_CONTAINER }}" \
+            -backend-config="key=${TF_STATE_KEY}" \
+            -backend-config="use_azuread_auth=true"
+
+      - name: Terraform validate
+        working-directory: ${{ env.TF_WORKING_DIRECTORY }}
+        shell: bash
+        run: |
+          terraform validate \
+            -no-color
+
+      - name: Terraform plan
+        working-directory: ${{ env.TF_WORKING_DIRECTORY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          terraform plan \
+            -input=false \
+            -lock=true \
+            -lock-timeout="10m" \
+            -var-file="${TFVARS_FILE}" \
+            -out="tfplan"
+
+      - name: Generate readable Terraform plan
+        working-directory: ${{ env.TF_WORKING_DIRECTORY }}
+        shell: bash
+        run: |
+          terraform show \
+            -no-color \
+            tfplan > tfplan.txt
+
+      # For GitHub Enterprise Cloud, use actions/upload-artifact@v4.
+      # For GHES 3.14, use the organization-approved GHES-compatible version.
+      - name: Upload Terraform plan
+        uses: actions/upload-artifact@v3
+        with:
+          name: tfplan-${{ inputs.infrastructure_component }}-dev-${{ github.run_id }}
+          path: |
+            ${{ env.TF_WORKING_DIRECTORY }}/tfplan
+            ${{ env.TF_WORKING_DIRECTORY }}/tfplan.txt
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Add Terraform plan summary
+        shell: bash
+        run: |
+          {
+            echo "## Terraform Plan"
+            echo
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Environment | \`dev\` |"
+            echo "| Component | \`${{ inputs.infrastructure_component }}\` |"
+            echo "| Requested action | \`${{ inputs.terraform_action }}\` |"
+            echo "| Working directory | \`${TF_WORKING_DIRECTORY}\` |"
+            echo "| Variables file | \`${TFVARS_FILE}\` |"
+            echo "| State key | \`${TF_STATE_KEY}\` |"
+            echo "| Commit | \`${{ github.sha }}\` |"
+            echo
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          if [[ "${{ inputs.terraform_action }}" == "plan" ]]; then
+            echo "Plan-only execution. No infrastructure changes will be applied." \
+              >> "${GITHUB_STEP_SUMMARY}"
+          else
+            echo "Terraform Apply will wait for approval through the protected Dev environment." \
+              >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+  # ===========================================================================
+  # Apply the exact saved Terraform plan
+  #
+  # The environment reference below activates the Required Reviewers gate.
+  # No step in this job starts until an authorized reviewer approves it.
+  # ===========================================================================
+  terraform-apply:
+    name: Terraform Apply
+    needs: terraform-plan
+
+    if: ${{ inputs.terraform_action == 'apply' }}
+
+    runs-on: ubuntu-latest
+
+    environment:
+      name: dev
+
+    env:
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Login to Azure using Service Principal
+        uses: azure/login@v2
+        with:
+          creds: >-
+            {
+              "clientId": "${{ vars.AZURE_CLIENT_ID }}",
+              "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
+              "subscriptionId": "${{ vars.AZURE_SUBSCRIPTION_ID }}",
+              "tenantId": "${{ vars.AZURE_TENANT_ID }}"
+            }
+
+      # For GitHub Enterprise Cloud, use actions/download-artifact@v4.
+      # For GHES 3.14, use the organization-approved GHES-compatible version.
+      - name: Download approved Terraform plan
+        uses: actions/download-artifact@v3
+        with:
+          name: tfplan-${{ inputs.infrastructure_component }}-dev-${{ github.run_id }}
+          path: ${{ env.TF_WORKING_DIRECTORY }}
+
+      - name: Verify downloaded Terraform plan
+        working-directory: ${{ env.TF_WORKING_DIRECTORY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! -f "tfplan" ]]; then
+            echo "::error::Terraform plan artifact was not downloaded."
+            exit 1
+          fi
+
+          echo "Terraform plan artifact downloaded successfully."
+
+      - name: Terraform init
+        working-directory: ${{ env.TF_WORKING_DIRECTORY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          terraform init \
+            -reconfigure \
+            -input=false \
+            -backend-config="resource_group_name=${{ vars.TF_STATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TF_STATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TF_STATE_CONTAINER }}" \
+            -backend-config="key=${TF_STATE_KEY}" \
+            -backend-config="use_azuread_auth=true"
+
+      - name: Display approved Terraform plan
+        working-directory: ${{ env.TF_WORKING_DIRECTORY }}
+        shell: bash
+        run: |
+          terraform show \
+            -no-color \
+            tfplan
+
+      - name: Apply approved Terraform plan
+        working-directory: ${{ env.TF_WORKING_DIRECTORY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          terraform apply \
+            -input=false \
+            -auto-approve \
+            -lock=true \
+            -lock-timeout="10m" \
+            tfplan
+
+      - name: Capture Terraform outputs
+        if: success()
+        working-directory: ${{ env.TF_WORKING_DIRECTORY }}
+        shell: bash
+        run: |
+          terraform output \
+            -json > terraform-outputs.json
+
+      - name: Upload Terraform outputs
+        if: success()
+        uses: actions/upload-artifact@v3
+        with:
+          name: terraform-outputs-${{ inputs.infrastructure_component }}-dev-${{ github.run_id }}
+          path: ${{ env.TF_WORKING_DIRECTORY }}/terraform-outputs.json
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Add deployment summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Terraform Deployment"
+            echo
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Environment | \`dev\` |"
+            echo "| Component | \`${{ inputs.infrastructure_component }}\` |"
+            echo "| State key | \`${TF_STATE_KEY}\` |"
+            echo "| Commit | \`${{ github.sha }}\` |"
+            echo "| Result | \`${{ job.status }}\` |"
+          } >> "${GITHUB_STEP_SUMMARY}"
