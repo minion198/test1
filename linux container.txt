@@ -1,0 +1,136 @@
+name: Import Container TAR to ACR
+
+on:
+  workflow_dispatch:
+    inputs:
+      blob_name:
+        description: "Blob name (including path)"
+        required: true
+        default: "myapp/myapp.tar"
+
+      acr_repository:
+        description: "Target ACR Repository"
+        required: true
+        default: "apps/myapp"
+
+      image_tag:
+        description: "Target Tag"
+        required: true
+        default: "1.0.0"
+
+env:
+  STORAGE_ACCOUNT: ${{ vars.STORAGE_ACCOUNT_NAME }}
+  STORAGE_CONTAINER: ${{ vars.STORAGE_CONTAINER_NAME }}
+  ACR_NAME: ${{ vars.ACR_NAME }}
+
+jobs:
+
+  import-image:
+
+    runs-on:
+      - self-hosted
+      - linux
+      - docker
+
+    steps:
+
+    - name: Azure Login
+      run: |
+
+        az login \
+          --service-principal \
+          --username "${{ secrets.AZURE_CLIENT_ID }}" \
+          --password "${{ secrets.AZURE_CLIENT_SECRET }}" \
+          --tenant "${{ secrets.AZURE_TENANT_ID }}"
+
+        az account set \
+          --subscription "${{ secrets.AZURE_SUBSCRIPTION_ID }}"
+
+    - name: Download TAR
+      run: |
+
+        mkdir -p images
+
+        az storage blob download \
+          --account-name $STORAGE_ACCOUNT \
+          --container-name $STORAGE_CONTAINER \
+          --name "${{ github.event.inputs.blob_name }}" \
+          --file images/image.tar \
+          --auth-mode login
+
+    - name: Capture Existing Images
+      run: |
+
+        docker image ls -aq > before.txt
+
+    - name: Load Docker Image
+      run: |
+
+        docker load -i images/image.tar
+
+    - name: Detect Newly Loaded Image
+      run: |
+
+        docker image ls -aq > after.txt
+
+        IMAGE_ID=$(comm -13 \
+          <(sort before.txt) \
+          <(sort after.txt) \
+          | head -1)
+
+        if [ -z "$IMAGE_ID" ]; then
+          echo "Unable to determine loaded image."
+          exit 1
+        fi
+
+        echo "IMAGE_ID=$IMAGE_ID" >> $GITHUB_ENV
+
+    - name: Login to ACR
+      run: |
+
+        TOKEN=$(az acr login \
+          --name $ACR_NAME \
+          --expose-token \
+          --query accessToken \
+          -o tsv)
+
+        docker login \
+          $ACR_NAME.azurecr.io \
+          -u 00000000-0000-0000-0000-000000000000 \
+          -p $TOKEN
+
+    - name: Tag Image
+      run: |
+
+        docker tag \
+          $IMAGE_ID \
+          $ACR_NAME.azurecr.io/${{ github.event.inputs.acr_repository }}:${{ github.event.inputs.image_tag }}
+
+    - name: Push Image
+      run: |
+
+        docker push \
+          $ACR_NAME.azurecr.io/${{ github.event.inputs.acr_repository }}:${{ github.event.inputs.image_tag }}
+
+    - name: Verify
+      run: |
+
+        az acr repository show \
+          --name $ACR_NAME \
+          --image "${{ github.event.inputs.acr_repository }}:${{ github.event.inputs.image_tag }}"
+
+    - name: Cleanup
+      if: always()
+      run: |
+
+        docker logout $ACR_NAME.azurecr.io || true
+
+        docker image rm \
+          $ACR_NAME.azurecr.io/${{ github.event.inputs.acr_repository }}:${{ github.event.inputs.image_tag }} \
+          || true
+
+        docker image rm $IMAGE_ID || true
+
+        rm -rf images before.txt after.txt
+
+        az logout
