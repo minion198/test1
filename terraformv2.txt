@@ -1,0 +1,203 @@
+name: Terraform Dev Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      component:
+        description: Infrastructure Component
+        required: true
+        type: choice
+        options:
+          - container-app-environment
+          - container-apps
+          - postgres
+          - storage-account
+          - key-vault
+          - redis
+          - log-analytics
+
+      action:
+        description: Terraform Action
+        required: true
+        default: plan
+        type: choice
+        options:
+          - plan
+          - apply
+
+permissions:
+  contents: read
+
+env:
+  ENVIRONMENT: dev
+
+  TF_DIR: infrastructure/${{ inputs.component }}
+  TFVARS: dev.tfvars
+  TFSTATE: dev/${{ inputs.component }}.tfstate
+
+  ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+  ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+  ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+jobs:
+
+  validate:
+
+    runs-on:
+      - self-hosted
+      - linux
+
+    steps:
+
+      - uses: actions/checkout@v3
+
+      - name: Verify tools
+        run: |
+          terraform version
+          which terraform
+
+          az version
+          which az
+
+      - name: Terraform fmt
+        run: terraform fmt -check -recursive
+
+      - name: Terraform validate
+
+        working-directory: ${{ env.TF_DIR }}
+
+        run: |
+          terraform init \
+            -backend=false
+
+          terraform validate
+
+  plan:
+
+    needs: validate
+
+    runs-on:
+      - self-hosted
+      - linux
+
+    steps:
+
+      - uses: actions/checkout@v3
+
+      - name: Login Azure
+
+        run: |
+
+          az login \
+            --service-principal \
+            -u "$ARM_CLIENT_ID" \
+            -p "$ARM_CLIENT_SECRET" \
+            --tenant "$ARM_TENANT_ID"
+
+          az account set \
+            --subscription "$ARM_SUBSCRIPTION_ID"
+
+      - name: Terraform Init
+
+        working-directory: ${{ env.TF_DIR }}
+
+        run: |
+
+          terraform init \
+            -reconfigure \
+            -backend-config="resource_group_name=${{ vars.TF_STATE_RG }}" \
+            -backend-config="storage_account_name=${{ vars.TF_STATE_STORAGE }}" \
+            -backend-config="container_name=${{ vars.TF_STATE_CONTAINER }}" \
+            -backend-config="key=${TFSTATE}"
+
+      - name: Terraform Plan
+
+        working-directory: ${{ env.TF_DIR }}
+
+        run: |
+
+          terraform plan \
+            -var-file="${TFVARS}" \
+            -out=tfplan
+
+      - name: Upload Plan
+
+        uses: actions/upload-artifact@v3
+
+        with:
+
+          name: tfplan
+
+          path: |
+            ${{ env.TF_DIR }}/tfplan
+            ${{ env.TF_DIR }}/.terraform.lock.hcl
+
+  apply:
+
+    if: inputs.action == 'apply'
+
+    needs: plan
+
+    environment:
+      name: dev
+
+    runs-on:
+      - self-hosted
+      - linux
+
+    steps:
+
+      - uses: actions/checkout@v3
+
+      - name: Download Plan
+
+        uses: actions/download-artifact@v3
+
+        with:
+
+          name: tfplan
+
+          path: ${{ env.TF_DIR }}
+
+      - name: Login Azure
+
+        run: |
+
+          az login \
+            --service-principal \
+            -u "$ARM_CLIENT_ID" \
+            -p "$ARM_CLIENT_SECRET" \
+            --tenant "$ARM_TENANT_ID"
+
+          az account set \
+            --subscription "$ARM_SUBSCRIPTION_ID"
+
+      - name: Terraform Init
+
+        working-directory: ${{ env.TF_DIR }}
+
+        run: |
+
+          terraform init \
+            -reconfigure \
+            -backend-config="resource_group_name=${{ vars.TF_STATE_RG }}" \
+            -backend-config="storage_account_name=${{ vars.TF_STATE_STORAGE }}" \
+            -backend-config="container_name=${{ vars.TF_STATE_CONTAINER }}" \
+            -backend-config="key=${TFSTATE}"
+
+      - name: Terraform Apply
+
+        working-directory: ${{ env.TF_DIR }}
+
+        run: |
+
+          terraform apply tfplan
+
+      - name: Terraform Outputs
+
+        working-directory: ${{ env.TF_DIR }}
+
+        run: |
+
+          terraform output
